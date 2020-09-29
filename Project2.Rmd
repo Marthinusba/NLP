@@ -25,7 +25,7 @@ library(data.table)
 library(ggplot2)
 library(lubridate)
 library(stringr)
-
+install_tensorflow()
 # point to where the txt files are
 txt_files <- list.files("sona")
 
