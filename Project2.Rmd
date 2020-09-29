@@ -1,0 +1,357 @@
+---
+title: "Project2"
+author: "Marthinus Basson"
+date: "9/6/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+During this project the problem addressed is to predict which president said a sentence during the State of the Nation adderess by using historical data. The data came as text files contating the entire speech from each presedient in the respective year the sona was made.
+
+To address this problem, a neural network should be created to have a sentence as an input and the respective president who said that senctence as the output.
+
+First the text data is imported and the president and respective year are extracted from the text name. Each sentence is given an unique Id and each president is given a unique id. Then the sentences are unnested to words, the filler words are removed. First a bag of words are created to analyse a bag of words model with the data.
+
+##Bag Of Words
+
+```{r Bag of Words}
+
+library(tidyverse)
+library(tidytext)
+library(data.table)
+library(ggplot2)
+library(lubridate)
+library(stringr)
+
+# point to where the txt files are
+txt_files <- list.files("sona")
+
+sona <- data.frame(filename = as.character(), speech = as.character())
+for(i in txt_files){
+  file_name <- paste0("sona/", i)
+  
+  # import text as single character string (can also read.table but the "seperator" causes problems)
+  this_speech <- readChar(file_name, 
+                          nchars = file.info(file_name)$size)
+  
+  # make data frame with metadata (filename contains year and pres) and speech
+  this_sona <- data.frame(filename = i, speech = this_speech, stringsAsFactors = FALSE)
+  
+  # make a single dataset
+  sona <- rbind(sona, this_sona)
+}
+
+
+#extract the year from each file name
+sona$year <- str_sub(sona$filename, start = 1, end = 4)
+#extract the president name from each file name(looking at where the word has a capital letter)
+pres_name<-str_extract(sona$filename,'[A-Z][a-z]+')
+
+#create dataset where with president name,year of speech and the text file
+new_sona<-cbind(pres_name,sona)%>%select(-filename)
+#create data table with speech unnested as sentences
+tidy_sona <- data.table(new_sona %>% unnest_tokens(text, speech, token = "sentences"))
+pres_id<-data.table(pres_name = unique(new_sona$pres_name),ID =0) #insert ID column 
+#fill id column with unique Id for each president
+  for(k in 1:length(pres_id$pres_name)){
+  
+    pres_id[k,]$ID<-k
+  
+  }
+#create dataset with unique ID of each president
+tidy_sona<-merge(tidy_sona,pres_id)
+tidy_sona$sentID<-0
+#fill dataset with unique id for each sentence
+  for(k in 1:length(tidy_sona$sentID)){
+  
+    tidy_sona[k,]$sentID<-k
+  
+  }
+#unnest sentences to word
+word_sona<-tidy_sona%>%select('ID',everything())%>%unnest_tokens(word,text,token = 'words')%>%filter(!word %in% stop_words$word, str_detect(word, "[a-z]"))
+word_bag<-word_sona%>% group_by(word)%>%count()%>%arrange(desc(n))%>%top_n(200, wt = n)%>%select(-n)
+
+#create data set where is infdicated the number of times a word is used within a sentence
+sona_tdf <- word_sona%>%
+  inner_join(word_bag) %>%
+  group_by(sentID,word) %>%
+  count() %>%  
+  group_by(sentID) %>%
+  mutate(total = sum(n)) %>%
+  ungroup()
+#create a bag of words for each sentence and each president's sona
+bag_o_words <- sona_tdf %>% 
+  select(sentID,word,n) %>% 
+  spread(key = word, value = n, fill = 0) %>%
+  left_join(tidy_sona %>% select(sentID,ID)) %>%
+  select(sentID, ID, everything())
+#remove 70% of bag of words matrix as training for neural network
+training_ids <- bag_o_words %>% 
+  group_by(ID) %>% 
+  sample_frac(0.7) %>% 
+  ungroup() %>%
+  select(sentID)
+
+#transform to data.table for faster processing and computation when doing joins
+bag_o_words<-data.table(bag_o_words)
+training_ids<-data.table(training_ids)
+#set the unique key for each data table
+setkey(bag_o_words,sentID)
+setkey(training_ids,sentID)
+#join training bag of words with their respective ID's 
+training_sona <-bag_o_words[training_ids]%>%select(-sentID)
+test_sona<-bag_o_words[!training_ids]%>%select(-sentID)
+
+
+```
+
+A neural network model is created to fit the bag of words model data. The bag of words data is split in to test and train data. 
+##Neural Net
+```{r Neural Net model}
+library(keras)
+#create training matrices from the bag of words created
+x_train <- as.matrix(training_sona %>% select(-ID), ncol = 9697)
+y_train <-as.matrix(1*(training_sona %>% select(ID)), ncol = 1)
+
+#create the test matices from the bag of words
+x_test <- as.matrix(test_sona %>% select(-ID), ncol = 9698)
+y_test <- as.matrix(test_sona %>% select(ID), ncol = 1)
+#hot encode the results matrix as it ranges from 1-6 for each president
+y_train<-to_categorical(y_train,7)
+y_test<-to_categorical(y_test,7)
+#
+#create the neural network model using keras
+model <- keras_model_sequential()
+
+model %>% 
+  layer_dense(units = 35,                  # number of neurons in the hidden layer
+              input_shape = c(9697)) %>%  
+  layer_dense(units = 35,                  # number of neurons in the hidden layer
+              input_shape = c(9697)) %>%# dimension of input array
+  layer_activation('relu') %>%             # use a rectified linear unit as an activation function in the hidden layer
+  layer_dense(units = 7) %>%               # adds an output layer to the network
+  layer_activation('sigmoid') 
+
+model %>% compile(
+  optimizer = 'rmsprop',
+  loss = 'binary_crossentropy',
+  metrics = c('accuracy')
+)
+```
+The model is fitted with the train data and to test the validity, it is evaluated with test data.
+```{r Neural Net}
+model %>% fit(x_train, y_train, epochs = 50, batch_size = 35) %>% plot() #fit the model
+ model %>% evaluate(x_test, y_test, batch_size=32, verbose = 1)#test the model using out of sample data
+model %>% predict_classes(x_test) #predict the presidents who said a the sentence contained in the test data
+
+
+```
+Next, from the bag of words model a new model is contructed to recieve sentences, but within the neural network, the sentence is not viewed as a whole, but its indevidual words.
+##Bag of Sentences
+```{r Bag of Sentencens}
+sent_sona<-word_sona%>%group_by(sentID)
+sent_sona<-sent_sona%>%group_by(sentID)%>%summarise(sent = paste(word,collapse = ",")) 
+
+sent_bag<-sent_sona%>% group_by(sent)%>%count()%>%arrange(desc(n))%>%top_n(200, wt = n)%>%select(-n)
+sona_sent <- sent_sona%>%
+  inner_join(sent_bag) %>%
+  group_by(sentID,sent) %>%
+  count() %>%  
+  group_by(sentID) %>%
+  mutate(total = sum(n)) %>%
+  ungroup()
+ bag_o_sent <- sona_sent %>% 
+  select(sentID,sent,n) %>% 
+  spread(key = sent, value = n, fill = 0) %>%
+  left_join(tidy_sona %>% select(sentID,ID)) %>%
+  select(sentID, ID, everything())
+ 
+ training_sentences <- bag_o_sent %>% 
+  group_by(ID) %>% 
+  sample_frac(0.7) %>% 
+  ungroup() %>%
+  select(sentID)
+
+#transform to data.table for faster processing and computation when doing joins
+bag_o_sent<-data.table(bag_o_sent)
+training_sentences<-data.table(training_sentences)
+#set the unique key for each data table
+setkey(bag_o_sent,sentID)
+setkey(training_sentences,sentID)
+#join training bag of words with their respective ID's 
+training_sona_sent <-bag_o_sent[training_sentences]%>%select(-sentID)
+test_sona_sent<-bag_o_sent[!training_sentences]%>%select(-sentID)
+```
+The neural network model for the sentence model is created.
+##Nueral Net sentences
+```{r Neural Net Sentences model}
+library(keras)
+#create training matrices from the bag of words created
+x_train_sent <- as.matrix(training_sona_sent %>% select(-ID), ncol = 7056)
+y_train_sent <-as.matrix(1*(training_sona_sent %>% select(ID)), ncol = 1)
+
+#create the test matices from the bag of words
+x_test_sent <- as.matrix(test_sona_sent %>% select(-ID), ncol = 7056)
+y_test_sent <- as.matrix(test_sona_sent %>% select(ID), ncol = 1)
+#hot encode the results matrix as it ranges from 1-6 for each president
+y_train_sent<-to_categorical(y_train_sent,7)
+y_test_sent<-to_categorical(y_test_sent,7)
+#
+#create the neural network model using keras
+model_2 <- keras_model_sequential()
+
+model_2 %>% 
+  layer_dense(units = 35,                  # number of neurons in the hidden layer
+              input_shape = c(7054)) %>%  
+  layer_dense(units = 35,                  # number of neurons in the hidden layer
+              input_shape = c(7054)) %>%# dimension of input array
+  layer_activation('relu') %>%             # use a rectified linear unit as an activation function in the hidden layer
+  layer_dense(units = 7) %>%               # adds an output layer to the network
+  layer_activation('softmax') 
+
+model_2 %>% compile(
+  optimizer = 'rmsprop',
+  loss = 'binary_crossentropy',
+  metrics = c('accuracy')
+)
+```
+##Neural Net Sent
+```{r Neural Net Sentences}
+model_2 %>% fit(x_train_sent, y_train_sent, epochs = 50, batch_size = 35) %>% plot() #fit the model
+ 
+model_2 %>% evaluate(x_test_sent, y_test_sent, batch_size=32, verbose = 1)#test the model using out of sample data
+model_2 %>% predict_classes(x_test_sent) #predict the presidents who said a the sentence contained in the test data
+
+```
+Sentiment analysis is done one the words of the sona to see which sona wsa positive and negative.
+##Sentiment Analysis
+
+```{r Sentiment analysis}
+sent_sona<-word_sona%>%left_join(get_sentiments('bing'))%>%select(word,sentiment,everything())%>%
+  mutate(sentiment = ifelse(is.na(sentiment), "neutral", sentiment))
+
+ 
+sentiments_per_sona <- sent_sona %>%
+  group_by(year,pres_name) %>%
+  summarize(net_sentiment = (sum(sentiment == "positive") - sum(sentiment == "negative")))
+
+ggplot(sentiments_per_sona, aes(sentiments_per_sona$pres_name, sentiments_per_sona$net_sentiment,shape=pres_name, color=pres_name)) +
+  geom_point() +
+  geom_point(data = sentiments_per_sona, aes(sentiments_per_sona$pres_name), colour = 'red', size = 1) + geom_text(label = sentiments_per_sona$year)+
+  guides(color = guide_legend(order=1),
+         size = guide_legend(order=2),
+         shape = guide_legend(order=3))
+
+ggplot(sentiments_per_sona, aes(sentiments_per_sona$year, sentiments_per_sona$net_sentiment,shape=pres_name, color=pres_name,group = 1)) +
+  geom_path() +
+  geom_point()+
+  geom_smooth()
+
+  
+
+
+
+
+```
+From the graph it can be seen that every sona was percieved as postive, some more than others, which would be expected from a sona. Next, the sentiment analysis is adjusted to look at words that reverses the sentiment for a positive/negative word. 
+## Current State Sentiment Analysis
+```{r Current Sentiment analysis}
+#Identify word within each sona that points to current state of the nation with words that point to future or past
+cur_sent_sona <- word_sona %>% 
+  left_join(get_sentiments("bing")) %>% # add sentiments (pos or neg)
+  select(word,sentiment,everything()) %>%
+  mutate(sentiment = ifelse(word == "will", NA, sentiment))%>%
+    mutate(sentiment = ifelse(is.na(sentiment), "neutral", sentiment))
+
+sentiments_per_sona <- sent_sona %>%
+  group_by(year,pres_name) %>%
+  summarize(net_sentiment = (sum(sentiment == "positive") - sum(sentiment == "negative")))
+
+
+ 
+sona_bigrams_separated  <- new_sona %>%
+  filter(!str_detect(speech, "^RT")) %>%
+  unnest_tokens(bigram, speech, token = "ngrams", n = 2) %>%
+  separate(bigram, c("word1", "word2"), sep = " ")
+
+sona_bigrams_separated<-sona_bigrams_separated%>%
+  left_join(get_sentiments('bing'),by = c(word1 = 'word'))%>%
+  rename(sentiment1 =sentiment)%>%mutate(sentiment1 = ifelse(is.na(sentiment1), "neutral", sentiment1))%>%
+  left_join(get_sentiments('bing'),by = c(word2 = 'word'))%>%
+  rename(sentiment2 = sentiment)%>%
+  mutate(sentiment2 = ifelse(is.na(sentiment2), "neutral", sentiment2))%>%
+  select(word1,word2,sentiment1,sentiment2,everything())
+  
+negation_words <- c("not", "no", "never", "without")
+
+sona_bigrams_separated <- sona_bigrams_separated%>%
+
+    # create a variable that is the opposite of sentiment2
+    mutate(opp_sentiment2 = recode(sentiment2, "positive" = "negative",
+                                 "negative" = "positive",
+                                 "neutral" = "neutral")) %>%
+    
+    # reverse sentiment2 if word1 is a negation word
+    mutate(sentiment2 = ifelse(word1 %in% negation_words, opp_sentiment2, sentiment2)) %>%
+    
+    # remove the opposite sentiment variable, which we don't need any more
+    select(-opp_sentiment2)
+
+sona_bigrams_separated <- sona_bigrams_separated %>%
+  mutate(net_sentiment = (sentiment1 == "positive") + (sentiment2 == "positive") - 
+              (sentiment1 == "negative") - (sentiment2 == "negative")) %>%
+  unite(bigram, word1, word2, sep = " ", remove = FALSE)
+
+sona_bigrams_separated<-sona_bigrams_separated%>%group_by(pres_name,year)%>%summarise(net_sentiment=sum(net_sentiment))
+
+ggplot(sona_bigrams_separated, aes(sona_bigrams_separated$year, sona_bigrams_separated$net_sentiment,shape=pres_name, color=pres_name,group = 1)) +
+  geom_path() +
+  geom_point()
+
+```
+And a analysis was done to select words that points to if the sona focuses more on what will be done and not the current state of the nation. This points to if the current state of the nation is postive or negative:
+```{r Current Sentiment analysis of future words}
+fut_negation_words <- c('to',"will","going","to ",'To')
+cur_sent_sona <- word_sona %>% 
+  left_join(get_sentiments("bing")) %>% # add sentiments (pos or neg)
+  select(word,sentiment,everything()) %>%
+  mutate(sentiment = ifelse(word== c('will','to'),"negative",sentiment))%>%
+    mutate(sentiment = ifelse(is.na(sentiment), "neutral", sentiment))
+
+  cur_sent_sona<- cur_sent_sona %>%
+  group_by(year,pres_name) %>%
+  summarize(net_sentiment = (sum(sentiment == "positive") - sum(sentiment == "negative")))
+  
+  ggplot(cur_sent_sona, aes(cur_sent_sona$year,cur_sent_sona$net_sentiment,shape=pres_name, color=pres_name,group = 1)) +
+  geom_path() +
+  geom_point()
+
+```
+As can be seen from the last graph, the negativity points more accurately to the percieved state of the nation. Below a analysis is done to plot the GDP of South Africa (taken as an indication of the state of the nation) to see if it correlated with the state of the nation positivity or negativity
+```{r GDP}
+library(gridExtra)
+gdp<-data.table(c(1960,	1961	,1962	,1963,	1964,	1965,	1966,	1967,	1968,	1969,	1970,	1971,	1972,	1973,	1974	,1975,	1976,	1977	,1978,1979	,1980,	1981,	1982,	1983,	1984,	1985,	1986,	1987,	1988,	1989,	1990,	1991,	1992	,1993,	1994,	1995	,1996	,1997,	1998,	1999,	2000,	2001,	2002,	2003,	2004,	2005,	2006,	2007,	2008,	2009	,2010,	2011,	2012	,2013	,2014,	2015,	2016,	2017),c(7575248495,	7972840543	,8497830043	,9423211536,	10373792524,	11334173317,	12354752905,	13777124458,	14894302114,	16780064399,	18418031639,	20334172260	,21358137115	,29293948127	,36806475350	,38114942529	,36601885925	,40649724011,	46737580497,	57647268409,	82984078069	,89629496833	,82696902010	,88786580363	,87880468269	,69208451593,	82107924006,	107414974090,	118331510445,	128902675071,	115553279481,	123943432441,	134545231417,	134309759158,	139752450152,	155460285076,	147607982695,	152586154514,	137774361015,	136631966609,	136361854808,	121600818310,	115748110113,	175256916996,	228937347866,	257671413751,	271811088781,	299033511000,	287099991517,	297216730669,	375298134440,	416878162441,	396332598448,	366810014300,	351119102947,	317610719411,	295456189492))
+colnames(gdp)<-c('year','Amount')
+ggplot(gdp[35:57,],aes(year,Amount))+
+  geom_path()+
+geom_point()+
+  geom_smooth(method = lm)
+
+PLOT2<-ggplot(sona, aes(cur_sent_sona$year,cur_sent_sona$net_sentiment,shape=pres_name, color=pres_name,group = 1)) +
+  geom_path() +
+  geom_point()
+cur_sent_sona<-data.table(cur_sent_sona)
+sentiments_per_sona<-data.table(sentiments_per_sona)
+gdp$year<-as.character(gdp$year)
+this_set<-gdp[sentiments_per_sona, on = 'year']
+
+ggplot(this_set,aes(Amount,net_sentiment))+
+  geom_point()
+
+
+```
+
+As can be seen for the plots, the correlation between the GDP and SONA is non existing , which either points to that the GDP is not a good indicator the the positivity/negativity of a country or the SONA's are over inflated with positivity.
